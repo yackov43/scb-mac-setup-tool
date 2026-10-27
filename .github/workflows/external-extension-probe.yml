@@ -1,0 +1,35 @@
+name: External Extensions probe (does Chrome install and KEEP the extension from a JSON in the profile folder?)
+
+# Real macOS runner, fresh Chrome profile per case. Downloads only the public extension files from the production site.
+# No debugging port. Every step is time-boxed (script hard-exit 170 s, job 15 min) and Chrome is killed after each case.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Clear the Homebrew download flag
+        run: xattr -dr com.apple.quarantine "/Applications/Google Chrome.app" 2>/dev/null || true
+      - name: Both variants (local CRX, update URL)
+        run: |
+          set +e
+          for v in crx url; do
+            VARIANT=$v node scripts/ci/external-probe.mjs 2>&1 | grep -E "^RESULT|^JSON|Error"
+            pkill -KILL -f "Google Chrome.app/Contents/MacOS/Google Chrome" 2>/dev/null; sleep 2
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: external-probe-shots
+          path: /tmp/shots/*.png
+          retention-days: 5
+      - name: Cleanup
+        if: always()
+        run: pkill -KILL -f "Google Chrome" 2>/dev/null || true

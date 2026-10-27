@@ -1,0 +1,38 @@
+name: Extension persistence probe (does a CDP-loaded extension survive closing Chrome AND a normal restart?)
+
+# Real macOS runner, fresh Chrome profile per case. Read-only: nothing leaves the runner. Every step is time-boxed
+# (the script hard-exits after 150 s per case; the job after 15 min) and Chrome is killed after each case.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Chrome version + clear the Homebrew download flag
+        run: |
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version
+          xattr -dr com.apple.quarantine "/Applications/Google Chrome.app" 2>/dev/null || true
+      - name: Load with the tool's CDP path, quit, then start Chrome normally the two ways a user/tool can
+        run: |
+          set +e
+          for c in "drop 1 alias"; do
+            set -- $c
+            DIAG=1 LOAD=$1 NONDEFAULT=$2 RESTART=$3 node scripts/ci/persist-probe.mjs 1500 term 2>&1 | grep -E "^RESULT|^SNAP|^DROP|Error"
+            pkill -KILL -f "Google Chrome.app/Contents/MacOS/Google Chrome" 2>/dev/null; sleep 2
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: persist-probe-shots
+          path: /tmp/shots/*.png
+          retention-days: 5
+      - name: Cleanup
+        if: always()
+        run: pkill -KILL -f "Google Chrome" 2>/dev/null || true

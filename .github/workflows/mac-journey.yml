@@ -1,0 +1,198 @@
+name: Mac Journey (build tar.gz, install it with the one-liner, Chrome load + pin, LaunchAgent)
+
+# Runs on a REAL macOS runner. This repository is public ONLY so GitHub's macOS minutes are free; it holds just the Mac setup
+# tool (client-side code every customer already receives) and has no secrets, no bot, no database and no extension source.
+# Read-only against production: it only downloads the public extension package from the site below.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --test test/*.test.js
+
+  build:
+    needs: unit
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build SunoCoverBotSetup-mac.tar.gz
+        run: bash scripts/setup-tool/build-mac.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SunoCoverBotSetup-mac-pkg
+          path: |
+            public/SunoCoverBotSetup-mac.tar.gz
+            public/SunoCoverBotSetup-mac.tar.gz.sha256
+          retention-days: 30
+
+  journey:
+    needs: build
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      SITE: https://46-225-2-111.sslip.io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@v4
+        with:
+          name: SunoCoverBotSetup-mac-pkg
+          path: /tmp/serve
+
+      - name: "1) A real user's Chrome is already open on their default profile (no debugging flags)"
+        run: |
+          set +e
+          mkdir -p /tmp/shots
+          CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          # The runner's Chrome comes from Homebrew with the download flag; a real user's Chrome has long since been opened once.
+          xattr -dr com.apple.quarantine "/Applications/Google Chrome.app" 2>/dev/null
+          # Seed Chrome's first-run sentinel so the runner shows no "Welcome to Google Chrome" dialog that would block quitting it later.
+          mkdir -p "$HOME/Library/Application Support/Google/Chrome" && : > "$HOME/Library/Application Support/Google/Chrome/First Run"
+          nohup "$CHROME" --no-first-run --no-default-browser-check "https://example.com/?user-tab-1" "https://example.org/?user-tab-2" >/tmp/chrome-user.log 2>&1 &
+          sleep 12
+          ps -axo pid=,command= | grep "Google Chrome.app/Contents/MacOS/Google Chrome " | grep -v grep | grep -v -- "--type=" | cut -c1-200
+          screencapture -x /tmp/shots/0-user-chrome-before.png || true
+
+      - name: 2) Serve the freshly built package locally and install it with the generated one-liner
+        run: |
+          set -euo pipefail
+          ls -la /tmp/serve; cat /tmp/serve/SunoCoverBotSetup-mac.tar.gz.sha256
+          (cd /tmp/serve && nohup python3 -m http.server 8765 --bind 127.0.0.1 >/tmp/http.log 2>&1 &)
+          sleep 2
+          node --input-type=module -e "
+            import { macSetupInstallScript } from './src/macSetupInstallScript.js';
+            import { writeFileSync } from 'node:fs';
+            const s = macSetupInstallScript('$SITE').split('$SITE').join('http://127.0.0.1:8765');
+            writeFileSync('/tmp/install-mac-local.sh', s);
+          "
+          grep -c "127.0.0.1:8765" /tmp/install-mac-local.sh
+          bash /tmp/install-mac-local.sh
+          APP="$HOME/Applications/SunoCoverBotSetup.app"
+          test -d "$APP" && echo "APP_INSTALLED=1"
+          echo "--- quarantine flag on the app (must be absent)"; xattr "$APP" | grep -c quarantine || true
+          echo "--- no disk image mounted"; (mount | grep -i "/Volumes/SunoCoverBot" || echo "(none)")
+
+      - name: "3) The app does everything by itself - watch the window and Chrome for 2 minutes"
+        run: |
+          set +e
+          prev=0
+          for t in 6 15 25 35 45 60 80 100 120; do
+            sleep $(( t - prev )); prev=$t
+            screencapture -x "/tmp/shots/1-journey-${t}s.png" || true
+            echo "== ${t}s: Chrome main processes"
+            ps -axo pid=,command= | grep "Google Chrome.app/Contents/MacOS/Google Chrome" | grep -v grep | grep -v -- "--type=" | cut -c1-230
+          done
+          ROOT="$HOME/Library/Application Support/SunoCoverBot"
+          echo "--- setup logs"; for f in "$ROOT"/setup/*.log; do [ -f "$f" ] && { echo "== $f"; tail -n 12 "$f"; }; done
+          echo "--- LaunchAgent"; launchctl print "gui/$(id -u)/io.sslip.sunocoverbot.update" | grep -E "state|program|--update|run interval|runs|last exit" | head -8
+
+      - name: 4) What Chrome ended up with - extension loaded and pinned in the real profile, no debugging port left open
+        run: |
+          set +e
+          D="$HOME/Library/Application Support/Google/Chrome"
+          python3 - "$D" <<'PY'
+          import json,sys,os,glob
+          d=sys.argv[1]; ID="geokjdngpomhdgjamobhgokjgphnjaed"
+          for prof in sorted(glob.glob(d+"/Default")+glob.glob(d+"/Profile *")):
+              for f in ("Secure Preferences","Preferences"):
+                  p=os.path.join(prof,f)
+                  if not os.path.exists(p): continue
+                  j=json.load(open(p)); e=j.get("extensions",{})
+                  s=e.get("settings",{}).get(ID)
+                  if s: print(os.path.basename(prof),f,"path=",s.get("path"),"location=",s.get("location"),"disable_reasons=",s.get("disable_reasons"))
+                  print(os.path.basename(prof),f,"pinned_extensions has ours:",ID in (e.get("pinned_extensions") or []))
+          PY
+          echo "--- debugging port file left behind?"; ls "$D/DevToolsActivePort" 2>&1 | head -2
+          echo "--- any Chrome still started with a debugging port?"; ps -axo command= | grep -c -- "--remote-debugging-port" 
+          echo "--- user Chrome session restored? (Current Session / Tabs files)"; ls -la "$D/Default/Sessions" 2>/dev/null | head
+          screencapture -x /tmp/shots/2-final-chrome.png || true
+          echo "--- tabs Chrome restored (Current Tabs / session files are binary: read the window titles instead)"
+          osascript -e 'tell application "System Events" to get name of every window of process "Google Chrome"' 2>&1 | head -3
+
+      - name: 4b) Is the extension really PERSISTED? poll the profile, quit Chrome gracefully (flushes prefs), re-read, relaunch like a user, screenshot chrome://extensions
+        run: |
+          set +e
+          D="$HOME/Library/Application Support/Google/Chrome"
+          CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          cat > /tmp/prefs.py <<'PY'
+          import json,sys,os,glob
+          d=sys.argv[1]; ID="geokjdngpomhdgjamobhgokjgphnjaed"
+          for prof in sorted(glob.glob(d+"/Default")+glob.glob(d+"/Profile *")):
+              for f in ("Secure Preferences","Preferences"):
+                  p=os.path.join(prof,f)
+                  if not os.path.exists(p): continue
+                  e=json.load(open(p)).get("extensions",{})
+                  for k,s in (e.get("settings") or {}).items():
+                      if k==ID or "SunoCoverBot" in str(s.get("path")):
+                          print(os.path.basename(prof),f,"id=",k,"path=",s.get("path"),"location=",s.get("location"),"disable_reasons=",s.get("disable_reasons"))
+                  print(os.path.basename(prof),f,"pinned:",ID in (e.get("pinned_extensions") or []),"| settings entries:",len(e.get("settings") or {}))
+          PY
+          echo "--- poll up to 60s for the extension entry (Chrome still running)"
+          for i in $(seq 1 12); do python3 /tmp/prefs.py "$D" | grep -q "path=" && break; sleep 5; done
+          python3 /tmp/prefs.py "$D"
+          echo "--- graceful quit (this is when Chrome flushes its preference files)"
+          osascript -e 'tell application "Google Chrome" to quit' 2>&1 | head -2
+          for i in $(seq 1 12); do [ $(ps -axo command= | grep 'Google Chrome.app/Contents/MacOS/Google Chrome' | grep -v grep | grep -vc -- '--type=') -eq 0 ] && break; sleep 2; done
+          # still alive (a dialog blocked the polite quit): SIGTERM is what a logout does; Chrome flushes prefs on it too
+          pkill -TERM -f 'Google Chrome.app/Contents/MacOS/Google Chrome ' ; sleep 8
+          echo "Chrome main processes left: $(ps -axo command= | grep 'Google Chrome.app/Contents/MacOS/Google Chrome' | grep -v grep | grep -vc -- '--type=')"
+          python3 /tmp/prefs.py "$D"
+          echo "--- relaunch the way a user would (no flags) on chrome://extensions"
+          nohup "$CHROME" --no-first-run --no-default-browser-check "chrome://extensions" >/tmp/chrome-relaunch.log 2>&1 &
+          sleep 15
+          python3 /tmp/prefs.py "$D"
+          screencapture -x /tmp/shots/4-after-relaunch-extensions.png || true
+
+      - name: "5) launchd runs the updater itself - outdated extension repaired, process exits"
+        run: |
+          set +e
+          ROOT="$HOME/Library/Application Support/SunoCoverBot"
+          FOLDER="$HOME/Documents/SunoCoverBot/extension"
+          LABEL="gui/$(id -u)/io.sslip.sunocoverbot.update"
+          python3 - "$FOLDER/manifest.json" <<'PY'
+          import json,sys
+          p=sys.argv[1]; m=json.load(open(p)); print("before:",m["version"]); m["version"]="1.0.0"; json.dump(m,open(p,"w"))
+          PY
+          START=$(date +%s)
+          launchctl kickstart -k "$LABEL"
+          for i in $(seq 1 60); do
+            S=$(launchctl print "$LABEL" | awk -F' = ' '/^	state = /{print $2; exit}')
+            [ "$S" != "running" ] && [ $i -gt 3 ] && break
+            sleep 2
+          done
+          echo "launchd state after $(( $(date +%s) - START ))s: $S"
+          launchctl print "$LABEL" | grep -E "state|runs|last exit code" | head -5
+          python3 -c "import json;print('after:',json.load(open('$FOLDER/manifest.json'))['version'])"
+          echo "--- update.log"; tail -n 8 "$ROOT/setup/update.log"
+          echo "--- Chrome processes the update touched (must be none new)"; ps -axo pid=,command= | grep "Google Chrome.app/Contents/MacOS/Google Chrome" | grep -v grep | grep -v -- "--type=" | cut -c1-200
+          perl -e 'alarm 60; exec @ARGV' "$ROOT/setup/SunoCoverBotSetup-core" --status-file /tmp/status1.json; cat /tmp/status1.json
+          screencapture -x /tmp/shots/3-final.png || true
+
+      - name: 6) Cleanup
+        if: always()
+        run: |
+          launchctl bootout "gui/$(id -u)/io.sslip.sunocoverbot.update" 2>/dev/null || true
+          pkill -f SunoCoverBot || true; pkill -f "Google Chrome" || true; pkill -f "http.server 8765" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mac-source-journey-shots
+          path: /tmp/shots/*.png
+          retention-days: 5
