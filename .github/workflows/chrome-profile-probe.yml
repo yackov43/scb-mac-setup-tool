@@ -1,0 +1,59 @@
+name: Chrome profile path probe (which spelling of the DEFAULT profile gets a debugging port?)
+
+# Chrome >= 136 ignores --remote-debugging-port when --user-data-dir is the default profile folder. A symlink alias was measured
+# NOT to get around it (the path is resolved first). This tries other spellings of the SAME folder on a real Mac and reports which
+# ones Chrome accepts. Read-only: it only starts a throwaway Chrome profile created on the runner.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/chrome-profile-probe.yml"
+
+jobs:
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - name: Create the default Chrome profile the way a user has one
+        run: |
+          set +e
+          CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          D="$HOME/Library/Application Support/Google/Chrome"
+          nohup "$CHROME" --no-first-run --no-default-browser-check about:blank >/tmp/c0.log 2>&1 &
+          sleep 12
+          pkill -TERM -f "Google Chrome.app/Contents/MacOS/Google Chrome" ; sleep 4
+          ls "$D" | head -5
+          "$CHROME" --version
+
+      - name: Try each spelling of the default folder
+        run: |
+          set +e
+          CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          D="$HOME/Library/Application Support/Google/Chrome"
+          DATA="/System/Volumes/Data$D"
+          LOWER=$(echo "$D" | tr 'A-Z' 'a-z')
+          DOT="$HOME/Library/Application Support/./Google/Chrome"
+          DOTDOT="$HOME/Library/../Library/Application Support/Google/Chrome"
+          SLASH="$HOME/Library/Application Support//Google/Chrome"
+          ln -sfn "$D" /tmp/scb-alias
+          try() {
+            name="$1"; dir="$2"
+            rm -f "$D/DevToolsActivePort"
+            nohup "$CHROME" "--user-data-dir=$dir" --remote-debugging-port=0 --enable-unsafe-extension-debugging --no-first-run --no-default-browser-check about:blank >/tmp/c.log 2>&1 &
+            for i in $(seq 1 14); do [ -f "$D/DevToolsActivePort" ] && break; sleep 1; done
+            if [ -f "$D/DevToolsActivePort" ]; then echo "RESULT $name = PORT OPENED"; else echo "RESULT $name = no port"; fi
+            pkill -TERM -f "Google Chrome.app/Contents/MacOS/Google Chrome" ; sleep 4
+          }
+          try "plain default path" "$D"
+          try "symlink alias" /tmp/scb-alias
+          try "/System/Volumes/Data prefix" "$DATA"
+          try "all-lowercase path" "$LOWER"
+          try "dot segment" "$DOT"
+          try "dot-dot segment" "$DOTDOT"
+          try "double slash" "$SLASH"
+          echo "--- sanity: a plainly different folder"
+          try "separate folder" /tmp/scb-other-profile
+          rm -f "$D/DevToolsActivePort"
+          [ -f /tmp/scb-other-profile/DevToolsActivePort ] && echo "(separate-folder port file exists)"

@@ -1,0 +1,72 @@
+name: Live Mac (owner key only)
+# A real Mac for the owner's own testing. Locked down by design (2026-11-04): SSH joins only with the owner PC's key,
+# the screen password is random, nothing is posted anywhere (no issue, no production report, no password in logs).
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  live-mac:
+    runs-on: macos-14
+    timeout-minutes: 360
+    steps:
+      - name: Start a locked-down live session
+        run: |
+          set -uo pipefail
+          set -x
+          sudo pmset -a displaysleep 0 disksleep 0 sleep 0 || true
+          nohup caffeinate -dimsu >/dev/null 2>&1 &
+          set +x
+          PW=$(python3 -c "import secrets,string;a=string.ascii_letters+string.digits;print(''.join(secrets.choice(a) for _ in range(8)))")
+          umask 077; echo "$PW" > "$HOME/.scb-live-password"; umask 022
+          OLD=$(sudo python3 -c 'k=[0x7D,0x89,0x52,0x23,0xD2,0xBC,0xDD,0xEA,0xA3,0xB9,0x1F]
+          d=open("/etc/kcpassword","rb").read();o=[]
+          for i,b in enumerate(d):
+              c=b^k[i%len(k)]
+              if c==0: break
+              o.append(chr(c))
+          print("".join(o))' 2>/dev/null || echo "")
+          sudo dscl . -passwd /Users/runner "$OLD" "$PW" || true
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes -clientopts -setvncmode -vncmode 2 -setvncpw -vncpw "$PW" -restart -agent -privs -all >/dev/null 2>&1 || true
+          set -x  # tracing only after every line that holds the password
+          sudo python3 - <<'PY' || true
+          import sqlite3,os
+          s=['kTCCServiceScreenCapture','kTCCServiceAccessibility','kTCCServicePostEvent','kTCCServiceListenEvent']
+          t=[('com.apple.screensharing.daemon',0),('com.apple.screensharing.agent',0),('com.apple.screensharing',0),('/System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd',1),('/System/Library/CoreServices/RemoteManagement/ScreensharingAgent.bundle/Contents/MacOS/ScreensharingAgent',1),('/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent',1)]
+          for db in ['/Library/Application Support/com.apple.TCC/TCC.db',os.path.expanduser('~/Library/Application Support/com.apple.TCC/TCC.db')]:
+              if not os.path.exists(db): continue
+              c=sqlite3.connect(db)
+              for x in s:
+                  for cl,ty in t: c.execute("INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,indirect_object_identifier_type,indirect_object_identifier,indirect_object_code_identity,flags,last_modified,pid,pid_version,boot_uuid,last_reminded) VALUES (?,?,?,2,4,1,NULL,NULL,NULL,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0)",(x,cl,ty))
+              c.commit()
+          PY
+          sudo killall tccd screensharingd 2>/dev/null || true
+          pip3 install websockify --break-system-packages >/dev/null 2>&1 || pip3 install websockify >/dev/null 2>&1 || true
+          git clone -q --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
+          python3 - <<'PY'
+          p='/tmp/novnc/core/rfb.js';s=open(p).read()
+          o='if (types.includes(securityTypeNone)) {'
+          if o in s: s=s.replace(o,'if (types.includes(securityTypeVNCAuth)) { this._securityType = securityTypeVNCAuth; } else '+o,1)
+          open(p,'w').write(s)
+          PY
+          nohup python3 -m websockify --web /tmp/novnc 6080 localhost:5900 >/tmp/websockify.log 2>&1 &
+          mkdir -p /tmp/bin && curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz | tar -xz -C /tmp/bin
+          nohup /tmp/bin/cloudflared tunnel --url http://localhost:6080 >/tmp/cf.log 2>&1 &
+          curl -sL https://github.com/owenthereal/upterm/releases/download/v0.41.0/upterm_darwin_arm64.tar.gz | tar -xz -C /tmp/bin upterm
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh && [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
+          echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH3a8eGgSaA3N/u1m5dmr5XfKpQWd7qYXBFkuJr5t8Ov railway-debug' > ~/.ssh/owner_authorized_keys
+          ssh-keyscan -H uptermd.upterm.dev >> ~/.ssh/known_hosts 2>/dev/null || true
+          /tmp/bin/upterm host --accept --allow-exec --skip-host-key-check --authorized-keys ~/.ssh/owner_authorized_keys --detach -- /bin/bash < /dev/null > /tmp/upterm.out 2>&1 &
+          for i in $(seq 1 45); do grep -q 'uptermd.upterm.dev' /tmp/upterm.out 2>/dev/null && break; sleep 1; done
+          mkdir -p /tmp/live; grep -m1 -o 'ssh [A-Za-z0-9]*@uptermd.upterm.dev' /tmp/upterm.out > /tmp/live/session.txt || { cat /tmp/upterm.out; exit 1; }
+          cat /tmp/live/session.txt
+          (open -a "Google Chrome" --args --no-first-run --no-default-browser-check https://suno.com &) || true
+      # Job logs appear only when the job ends; an artifact is readable at once. It holds only the ssh address,
+      # which nobody can use without the owner PC's key.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: live-session
+          path: /tmp/live/session.txt
+          if-no-files-found: error
+          retention-days: 1
+      - name: Keep the Mac running
+        run: sleep 21000

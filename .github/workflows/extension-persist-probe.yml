@@ -1,0 +1,69 @@
+name: Extension persistence probe (CDP load vs load+reload, and approval mode on the default profile)
+
+# Real macOS runner, fresh Chrome profile per case. Read-only: nothing leaves the runner. Every case is time-boxed
+# (each script hard-exits) and Chrome is killed after each case.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Chrome version + clear the Homebrew download flag
+        run: |
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version
+          sw_vers
+          xattr -dr com.apple.quarantine "/Applications/Google Chrome.app" 2>/dev/null || true
+      - name: Let the RUNNER click Chrome's Allow button (stands in for the person; the product never needs this)
+        run: |
+          chain=""; p=$$
+          while [ "$p" -gt 1 ]; do c=$(ps -o comm= -p "$p" 2>/dev/null); [ -n "$c" ] && chain="$chain|$c"; p=$(ps -o ppid= -p "$p" | tr -d ' '); done
+          export CHAIN="$chain|/usr/bin/osascript|$(command -v node)|/usr/sbin/screencapture"
+          sudo -E python3 - <<'PY' || true
+          import sqlite3,os
+          clients=[(c,1) for c in os.environ['CHAIN'].split('|') if c.startswith('/')]+[('com.apple.Terminal',0)]
+          for db in ['/Library/Application Support/com.apple.TCC/TCC.db',os.path.expanduser('~runner/Library/Application Support/com.apple.TCC/TCC.db')]:
+              if not os.path.exists(db): continue
+              c=sqlite3.connect(db)
+              for s in ['kTCCServiceAccessibility','kTCCServicePostEvent','kTCCServiceScreenCapture','kTCCServiceAppleEvents']:
+                  for cl,ty in clients:
+                      try: c.execute("INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,indirect_object_identifier_type,indirect_object_identifier,indirect_object_code_identity,flags,last_modified,pid,pid_version,boot_uuid,last_reminded) VALUES (?,?,?,2,4,1,NULL,NULL,NULL,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0)",(s,cl,ty))
+                      except Exception as e: print('tcc',db,s,cl,e)
+              c.commit()
+          print('granted', clients)
+          PY
+          sudo killall tccd 2>/dev/null || true
+      - name: "Case 1 (control): CDP load only, quit, normal start"
+        run: |
+          set +e
+          DIAG=1 LOAD=cdp NONDEFAULT=0 RESTART=direct node scripts/ci/persist-probe.mjs 1500 term 2>&1 | grep -E "^RESULT|^SNAP|^DIAG entry|Error"
+          pkill -KILL -f "Google Chrome.app/Contents/MacOS/Google Chrome" 2>/dev/null; sleep 2
+      - name: "Case 2: CDP load + developer mode + ONE reload, quit, normal start"
+        run: |
+          set +e
+          DIAG=1 LOAD=cdpreload NONDEFAULT=0 RESTART=direct node scripts/ci/persist-probe.mjs 1500 term 2>&1 | grep -E "^RESULT|^SNAP|^DIAG entry|^CDPRELOAD|Error"
+          pkill -KILL -f "Google Chrome.app/Contents/MacOS/Google Chrome" 2>/dev/null; sleep 2
+      - name: "Case 3: approval mode on the default profile (no restart, no flags)"
+        run: |
+          set +e
+          node scripts/ci/approval-probe.mjs 2>&1 | grep -E "^RESULT|^APPROVAL|^AX|Error"
+          pkill -KILL -f "Google Chrome.app/Contents/MacOS/Google Chrome" 2>/dev/null; sleep 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: persist-probe-shots-${{ matrix.os }}
+          path: /tmp/shots/*.png
+          retention-days: 5
+      - name: Cleanup
+        if: always()
+        run: pkill -KILL -f "Google Chrome" 2>/dev/null || true

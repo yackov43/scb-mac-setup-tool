@@ -1,0 +1,146 @@
+name: Mac silent journey (built tool, Terminal command, step 4 with NO approval - Chrome closes once and returns with its tabs)
+
+# REAL macOS runner. Builds the package from this mirror and installs it with the generated one-liner. The person's Chrome
+# is open with two tabs and remote debugging OFF, and NOBODY clicks anything. Checks: step 4 finishes; no "Allow" dialog
+# ever appears; the tabs come back; no network debugging port is left; Chrome survives the tool exiting; the extension
+# stays after a normal restart. The runner's Accessibility grant is used only to READ window and tab titles.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: macOS runner label (macos-latest = Apple silicon; macos-15-intel when arm64 capacity is short)
+        default: macos-latest
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --test test/*.test.js
+      - name: Build SunoCoverBotSetup-mac.tar.gz
+        run: bash scripts/setup-tool/build-mac.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SunoCoverBotSetup-mac-pkg
+          path: |
+            scratch/release-candidates/SunoCoverBotSetup-mac.tar.gz
+            scratch/release-candidates/SunoCoverBotSetup-mac.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  journey:
+    needs: build
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
+    timeout-minutes: 25
+    env:
+      SITE: https://46-225-2-111.sslip.io
+      CHROME: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@v4
+        with:
+          name: SunoCoverBotSetup-mac-pkg
+          path: /tmp/serve
+      - name: Runner may READ window titles (Accessibility for the runner only)
+        run: |
+          chain=""; p=$$
+          while [ "$p" -gt 1 ]; do c=$(ps -o comm= -p "$p" 2>/dev/null); [ -n "$c" ] && chain="$chain|$c"; p=$(ps -o ppid= -p "$p" | tr -d ' '); done
+          export CHAIN="$chain|/usr/bin/osascript|/usr/sbin/screencapture"
+          sudo -E python3 - <<'PY' || true
+          import sqlite3,os
+          clients=[(c,1) for c in os.environ['CHAIN'].split('|') if c.startswith('/')]
+          for db in ['/Library/Application Support/com.apple.TCC/TCC.db',os.path.expanduser('~runner/Library/Application Support/com.apple.TCC/TCC.db')]:
+              if not os.path.exists(db): continue
+              c=sqlite3.connect(db)
+              for s in ['kTCCServiceAccessibility','kTCCServiceScreenCapture']:
+                  for cl,ty in clients:
+                      try: c.execute("INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,indirect_object_identifier_type,indirect_object_identifier,indirect_object_code_identity,flags,last_modified,pid,pid_version,boot_uuid,last_reminded) VALUES (?,?,?,2,4,1,NULL,NULL,NULL,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0)",(s,cl,ty))
+                      except Exception as e: print('tcc',s,cl,e)
+              c.commit()
+          PY
+          sudo killall tccd 2>/dev/null || true
+          mkdir -p /tmp/shots
+      - name: "1) The person's Chrome is open with two tabs; remote debugging OFF"
+        run: |
+          "$CHROME" --version; sw_vers -productVersion
+          xattr -dr com.apple.quarantine "/Applications/Google Chrome.app" 2>/dev/null || true
+          D="$HOME/Library/Application Support/Google/Chrome"; mkdir -p "$D"; : > "$D/First Run"
+          nohup "$CHROME" --no-first-run --no-default-browser-check https://example.com https://www.iana.org/help/example-domains >/dev/null 2>&1 &
+          sleep 12
+          echo "BEFORE: $(osascript -l JavaScript scripts/ci/chrome-tabs.js 2>&1)"
+          screencapture -x /tmp/shots/0-before.png || true
+      - name: "2) Paste the Terminal command; nobody clicks anything"
+        run: |
+          set +e
+          (cd /tmp/serve && nohup python3 -m http.server 8765 --bind 127.0.0.1 >/tmp/http.log 2>&1 &)
+          sleep 2
+          node --input-type=module -e "
+            import { macSetupInstallScript } from './src/macSetupInstallScript.js';
+            import { writeFileSync } from 'node:fs';
+            writeFileSync('/tmp/install-mac-local.sh', macSetupInstallScript('$SITE').split('$SITE').join('http://127.0.0.1:8765'));
+          "
+          nohup bash /tmp/install-mac-local.sh > /tmp/terminal.log 2>&1 &
+          allow=0
+          for i in $(seq 1 90); do
+            grep -q '\[4/5\] [✓✕]' /tmp/terminal.log && break
+            n=$(osascript -l JavaScript scripts/ci/chrome-tabs.js 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("allowButtons",0))' 2>/dev/null || echo 0)
+            [ "${n:-0}" -gt 0 ] && allow=$((allow+1))
+            sleep 2
+          done
+          sleep 4; screencapture -x /tmp/shots/1-after-step4.png || true
+          echo "ALLOW_DIALOG_SEEN_TIMES=$allow"
+          echo "===== what the person's Terminal shows ====="; cat /tmp/terminal.log
+          grep -q '\[4/5\] ✓' /tmp/terminal.log && echo "STEP4=PASS" || echo "STEP4=FAIL"
+      - name: "3) Tabs back, no network port, Chrome launched by launchd, private pipe paths gone"
+        run: |
+          set +e
+          echo "AFTER: $(osascript -l JavaScript scripts/ci/chrome-tabs.js 2>&1)"
+          echo "--- Chrome main process (parent must be launchd = 1)"
+          ps -axo pid=,ppid=,command= | grep "Google Chrome.app/Contents/MacOS/Google Chrome" | grep -v grep | grep -v -- "--type=" | cut -c1-260
+          echo "--- TCP ports Chrome LISTENS on (must be none):"; lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | grep -i "chrome" || echo "(none)"
+          echo "--- leftover pipe folders (must be none):"; ls -d "${TMPDIR:-/tmp}"/scb-chrome-* 2>/dev/null || echo "(none)"
+      - name: "4) The setup tool exits: Chrome must keep running"
+        run: |
+          set +e
+          pkill -f SunoCoverBotSetup-core; sleep 6
+          n=$(ps -axo command= | grep "Google Chrome.app/Contents/MacOS/Google Chrome" | grep -v grep | grep -vc -- "--type=")
+          echo "CHROME_MAIN_PROCESSES_AFTER_TOOL_EXIT=$n"
+          screencapture -x /tmp/shots/2-after-tool-exit.png || true
+      - name: "5) Persistence: quit Chrome, read the profile, start it normally, read again"
+        run: |
+          set +e
+          show() { python3 - "$1" <<'PY'
+          import json,os,sys
+          sp=json.load(open(os.path.expanduser('~/Library/Application Support/Google/Chrome/Default/Secure Preferences')))
+          e=sp.get('extensions',{}); x=e.get('settings',{}).get('geokjdngpomhdgjamobhgokjgphnjaed')
+          print(sys.argv[1], ('PRESENT location=%s creation_flags=%s cdp_flag=%s disable_reasons=%s' % (x.get('location'), x.get('creation_flags'), bool((x.get('creation_flags') or 0) & 32768), x.get('disable_reasons', []))) if x else 'ABSENT', 'devMode=%s' % e.get('ui',{}).get('developer_mode'))
+          PY
+          }
+          pkill -TERM -f 'Google Chrome.app/Contents/MacOS/Google Chrome ' 2>/dev/null; sleep 8
+          show "after quitting Chrome:"
+          nohup "$CHROME" --no-first-run --no-default-browser-check >/dev/null 2>&1 &
+          sleep 15; screencapture -x /tmp/shots/3-normal-restart.png || true
+          pkill -TERM -f 'Google Chrome.app/Contents/MacOS/Google Chrome ' 2>/dev/null; sleep 8
+          show "after a NORMAL restart:"
+      - name: "6) Logs"
+        if: always()
+        run: |
+          echo "===== Terminal ====="; cat /tmp/terminal.log || true
+          echo "===== setup.log ====="; tail -30 "$HOME/Library/Application Support/SunoCoverBot/setup/setup.log" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mac-silent-journey-shots
+          path: /tmp/shots/*.png
+          retention-days: 5
+      - name: Cleanup
+        if: always()
+        run: pkill -f SunoCoverBot || true; pkill -f "Google Chrome" || true; pkill -f "http.server 8765" || true
