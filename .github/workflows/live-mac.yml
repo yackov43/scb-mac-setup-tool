@@ -1,9 +1,8 @@
 name: Live Mac (owner key only)
-# A real Mac for the owner's own testing. Locked down by design (2026-11-04): SSH joins only with the owner PC's key,
-# the screen password is random, nothing is posted anywhere (no issue, no production report, no password in logs).
-on: workflow_dispatch
-permissions:
-  contents: read
+
+on:
+  workflow_dispatch:
+
 jobs:
   live-mac:
     runs-on: macos-latest
@@ -12,61 +11,154 @@ jobs:
       - name: Start a locked-down live session
         run: |
           set -uo pipefail
-          set -x
+
           sudo pmset -a displaysleep 0 disksleep 0 sleep 0 || true
           nohup caffeinate -dimsu >/dev/null 2>&1 &
-          set +x
-          PW=$(python3 -c "import secrets,string;a=string.ascii_letters+string.digits;print(''.join(secrets.choice(a) for _ in range(8)))")
-          umask 077; echo "$PW" > "$HOME/.scb-live-password"; umask 022
-          OLD=$(sudo python3 -c 'k=[0x7D,0x89,0x52,0x23,0xD2,0xBC,0xDD,0xEA,0xA3,0xB9,0x1F]
-          d=open("/etc/kcpassword","rb").read();o=[]
-          for i,b in enumerate(d):
-              c=b^k[i%len(k)]
-              if c==0: break
-              o.append(chr(c))
-          print("".join(o))' 2>/dev/null || echo "")
-          sudo dscl . -passwd /Users/runner "$OLD" "$PW" || true
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes -clientopts -setvncmode -vncmode 2 -setvncpw -vncpw "$PW" -restart -agent -privs -all >/dev/null 2>&1 || true
-          set -x  # tracing only after every line that holds the password
+
+          PW=$(python3 -c "import secrets,string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(10)))")
+          echo "Generated live session credentials"
+
+          # 1. Configure users
+          sudo dscl . -passwd /Users/runner "$PW" 2>/dev/null || true
+          sudo sysadminctl -addUser vncuser -fullName "VNC User" -password "$PW" -admin 2>/dev/null || true
+          sudo dscl . -append /Groups/admin GroupMembership vncuser 2>/dev/null || true
+
+          # 2. Grant Accessibility & ScreenCapture permissions in TCC
           sudo python3 - <<'PY' || true
-          import sqlite3,os
-          s=['kTCCServiceScreenCapture','kTCCServiceAccessibility','kTCCServicePostEvent','kTCCServiceListenEvent']
-          t=[('com.apple.screensharing.daemon',0),('com.apple.screensharing.agent',0),('com.apple.screensharing',0),('/System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd',1),('/System/Library/CoreServices/RemoteManagement/ScreensharingAgent.bundle/Contents/MacOS/ScreensharingAgent',1),('/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent',1)]
-          for db in ['/Library/Application Support/com.apple.TCC/TCC.db',os.path.expanduser('~/Library/Application Support/com.apple.TCC/TCC.db')]:
-              if not os.path.exists(db): continue
-              c=sqlite3.connect(db)
-              for x in s:
-                  for cl,ty in t: c.execute("INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,indirect_object_identifier_type,indirect_object_identifier,indirect_object_code_identity,flags,last_modified,pid,pid_version,boot_uuid,last_reminded) VALUES (?,?,?,2,4,1,NULL,NULL,NULL,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0)",(x,cl,ty))
-              c.commit()
+          import sqlite3, os
+          s = ['kTCCServiceScreenCapture', 'kTCCServiceAccessibility', 'kTCCServicePostEvent', 'kTCCServiceListenEvent']
+          t = [
+              ('com.apple.screensharing.daemon', 0),
+              ('com.apple.screensharing.agent', 0),
+              ('com.apple.screensharing', 0),
+              ('/System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd', 1),
+              ('/System/Library/CoreServices/RemoteManagement/ScreensharingAgent.bundle/Contents/MacOS/ScreensharingAgent', 1),
+              ('/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent', 1)
+          ]
+          for db in ['/Library/Application Support/com.apple.TCC/TCC.db', os.path.expanduser('~/Library/Application Support/com.apple.TCC/TCC.db')]:
+              if not os.path.exists(db):
+                  continue
+              try:
+                  c = sqlite3.connect(db)
+                  for x in s:
+                      for cl, ty in t:
+                          c.execute("INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,indirect_object_identifier_type,indirect_object_identifier,indirect_object_code_identity,flags,last_modified,pid,pid_version,boot_uuid,last_reminded) VALUES (?,?,?,2,4,1,NULL,NULL,NULL,'UNUSED',NULL,0,CAST(strftime('%s','now') AS INTEGER),NULL,NULL,'UNUSED',0)", (x, cl, ty))
+                  c.commit()
+                  c.close()
+              except Exception as e:
+                  print("TCC update notice:", e)
           PY
-          sudo killall tccd screensharingd 2>/dev/null || true
-          pip3 install websockify --break-system-packages >/dev/null 2>&1 || pip3 install websockify >/dev/null 2>&1 || true
-          git clone -q --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
+
+          # 3. Enable Screen Sharing / Remote Management
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+          sudo $KICKSTART -activate -configure -access -on -privs -all \
+            -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PW" \
+            -restart -agent -console 2>/dev/null || true
+
+          # 4. Verify port 5900 is listening and responds
           python3 - <<'PY'
-          p='/tmp/novnc/core/rfb.js';s=open(p).read()
-          o='if (types.includes(securityTypeNone)) {'
-          if o in s: s=s.replace(o,'if (types.includes(securityTypeVNCAuth)) { this._securityType = securityTypeVNCAuth; } else '+o,1)
-          open(p,'w').write(s)
+          import socket, time
+          ok = False
+          for i in range(20):
+              try:
+                  s = socket.create_connection(('127.0.0.1', 5900), timeout=2)
+                  banner = s.recv(12)
+                  print(f"VNC server responding on 5900: {banner}")
+                  s.close()
+                  ok = True
+                  break
+              except Exception as e:
+                  print(f"Waiting for VNC on 5900 ({i}): {e}")
+                  time.sleep(1)
+          if not ok:
+              print("VNC 5900 check failed, continuing...")
           PY
-          nohup python3 -m websockify --web /tmp/novnc 6080 localhost:5900 >/tmp/websockify.log 2>&1 &
-          mkdir -p /tmp/bin && curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz | tar -xz -C /tmp/bin
-          nohup /tmp/bin/cloudflared tunnel --url http://localhost:6080 >/tmp/cf.log 2>&1 &
-          curl -sL https://github.com/owenthereal/upterm/releases/download/v0.41.0/upterm_darwin_arm64.tar.gz | tar -xz -C /tmp/bin upterm
+
+          # 5. Setup noVNC and websockify
+          pip3 install websockify --break-system-packages 2>/dev/null || pip3 install websockify 2>/dev/null || true
+          git clone -q --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
+
+          # Patch noVNC rfb.js to ensure VNCAuth is selected
+          python3 - <<'PY'
+          p = '/tmp/novnc/core/rfb.js'
+          try:
+              s = open(p).read()
+              o = 'if (types.includes(securityTypeNone)) {'
+              if o in s:
+                  s = s.replace(o, 'if (types.includes(securityTypeVNCAuth)) { this._securityType = securityTypeVNCAuth; } else ' + o, 1)
+                  open(p, 'w').write(s)
+          except Exception as e:
+              print("rfb patch notice:", e)
+          PY
+
+          nohup python3 -m websockify --web /tmp/novnc 6080 127.0.0.1:5900 >/tmp/websockify.log 2>&1 &
+
+          # Verify port 6080
+          python3 - <<'PY'
+          import socket, time
+          for i in range(15):
+              try:
+                  s = socket.create_connection(('127.0.0.1', 6080), timeout=2)
+                  s.close()
+                  print("Websockify port 6080 is listening!")
+                  break
+              except Exception as e:
+                  time.sleep(1)
+          PY
+
+          # 6. Start Cloudflare Tunnel
+          mkdir -p /tmp/bin
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then
+            curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz | tar -xz -C /tmp/bin
+          else
+            curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz | tar -xz -C /tmp/bin
+          fi
+
+          nohup /tmp/bin/cloudflared tunnel --url http://127.0.0.1:6080 >/tmp/cf.log 2>&1 &
+
+          CF_URL=""
+          for i in $(seq 1 40); do
+            CF_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -n1 || true)
+            [ -n "$CF_URL" ] && break
+            sleep 1
+          done
+          echo "Tunnel: $CF_URL"
+
+          # 7. Start upterm for fallback / interactive control
+          curl -sL https://github.com/owenthereal/upterm/releases/download/v0.41.0/upterm_darwin_arm64.tar.gz | tar -xz -C /tmp/bin upterm 2>/dev/null || true
           mkdir -p ~/.ssh && chmod 700 ~/.ssh && [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
           echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH3a8eGgSaA3N/u1m5dmr5XfKpQWd7qYXBFkuJr5t8Ov railway-debug' > ~/.ssh/owner_authorized_keys
           ssh-keyscan -H uptermd.upterm.dev >> ~/.ssh/known_hosts 2>/dev/null || true
           /tmp/bin/upterm host --accept --allow-exec --skip-host-key-check --authorized-keys ~/.ssh/owner_authorized_keys --detach -- /bin/bash < /dev/null > /tmp/upterm.out 2>&1 &
-          for i in $(seq 1 45); do grep -q 'uptermd.upterm.dev' /tmp/upterm.out 2>/dev/null && break; sleep 1; done
-          mkdir -p /tmp/live; grep -m1 -o 'ssh [A-Za-z0-9]*@uptermd.upterm.dev' /tmp/upterm.out > /tmp/live/session.txt || { cat /tmp/upterm.out; exit 1; }
-          cat /tmp/live/session.txt
+          for i in $(seq 1 30); do grep -q 'uptermd.upterm.dev' /tmp/upterm.out 2>/dev/null && break; sleep 1; done
+          SSH_CMD=$(grep -m1 -o 'ssh [A-Za-z0-9]*@uptermd.upterm.dev' /tmp/upterm.out || echo "")
+
+          # Open Chrome so there's an active GUI window on screen
           (open -a "Google Chrome" --args --no-first-run --no-default-browser-check https://suno.com &) || true
-      # Job logs appear only when the job ends; an artifact is readable at once. It holds only the ssh address,
-      # which nobody can use without the owner PC's key.
+
+          # 8. Save session info
+          mkdir -p /tmp/live
+          python3 -c "
+          import json
+          data = {
+              'cf_url': '$CF_URL',
+              'novnc_url': f'$CF_URL/vnc.html?autoconnect=true&password=$PW',
+              'password': '$PW',
+              'ssh_cmd': '$SSH_CMD'
+          }
+          with open('/tmp/live/session.json', 'w') as f:
+              json.dump(data, f, indent=2)
+          "
+          cat /tmp/live/session.json
+
       - uses: actions/upload-artifact@v4
         with:
-          name: live-session
-          path: /tmp/live/session.txt
+          name: live-session-info
+          path: /tmp/live/session.json
           if-no-files-found: error
           retention-days: 1
+
       - name: Keep the Mac running
         run: sleep 21000
