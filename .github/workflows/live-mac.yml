@@ -2,11 +2,6 @@ name: Live Mac (owner key only)
 
 on:
   workflow_dispatch:
-    inputs:
-      vnc_password:
-        description: 'VNC Password (leave blank for fixed default)'
-        required: false
-        default: ''
 
 jobs:
   live-mac:
@@ -26,10 +21,7 @@ jobs:
           nohup caffeinate -dimsu >/dev/null 2>&1 &
 
           # 1. Determine Password (Fixed default)
-          PW="${{ github.event.inputs.vnc_password }}"
-          if [ -z "$PW" ]; then
-            PW="${FIXED_PW:-SunoMac2026!}"
-          fi
+          PW="${FIXED_PW:-SunoMac2026!}"
           echo "Using fixed password for vncuser"
 
           # 2. User configuration
