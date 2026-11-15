@@ -21,8 +21,7 @@ jobs:
           nohup caffeinate -dimsu >/dev/null 2>&1 &
 
           # 1. Determine Password (Fixed default with clean sanitization)
-          RAW_PW="${FIXED_PW:-SunoMac2026!}"
-          PW=$(printf "%s" "$RAW_PW" | tr -d '\r\n\ufeff')
+          PW=$(python3 -c "import os; p = os.environ.get('FIXED_PW', 'SunoMac2026!').encode('utf-8').decode('utf-8-sig').strip(); print(''.join(c for c in p if 32 <= ord(c) <= 126) or 'SunoMac2026!')")
           echo "Using sanitized password for vncuser"
 
           # 2. User configuration
@@ -223,6 +222,7 @@ jobs:
           # 13. Update Permanent Redirect on Hetzner
           if [ -f ~/.ssh/id_hetzner ]; then
             $PY_BIN - <<PY
+          import urllib.parse
           link = '$NOVNC_LINK'
           html = f"""<!DOCTYPE html>
           <html>
@@ -232,12 +232,12 @@ jobs:
             <meta http-equiv="refresh" content="0; url={link}">
           </head>
           <body style="font-family:sans-serif; text-align:center; padding-top:60px; background:#121212; color:#eee;">
-            <h2>מתחבר ל-Mac בלייב (מסך רחב מותאם)...</h2>
+            <h2>מתחבר ל-Mac בלייב (מסך מותאם)...</h2>
             <p>אם אינך מועבר אוטומטית תוך 2 שניות, <a href="{link}" style="color:#4fa3d1;">לחץ כאן למעבר ישיר</a>.</p>
-            <script>window.location.href = "{link}";</script>
+            <script>location.replace("{link}");</script>
           </body>
           </html>"""
-          with open('/tmp/mac.html', 'w') as f:
+          with open('/tmp/mac.html', 'w', encoding='utf-8') as f:
               f.write(html)
           PY
             scp -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no /tmp/mac.html "$HETZNER_USER@$HETZNER_HOST:/opt/sunocoverbot/app/public/mac.html" 2>/dev/null || true
@@ -361,7 +361,7 @@ jobs:
             <p style="margin-top:20px; font-size:14px; color:#aaa;">מיד עם ההפעלה מחדש, הקישור הזה יחזור לפעול אוטומטית עם כל מה שהשארת.</p>
           </body>
           </html>"""
-          with open('/tmp/mac_stopped.html', 'w') as f:
+          with open('/tmp/mac_stopped.html', 'w', encoding='utf-8') as f:
               f.write(html)
           PY
             scp -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no /tmp/mac_stopped.html "$HETZNER_USER@$HETZNER_HOST:/opt/sunocoverbot/app/public/mac.html" 2>/dev/null || true
