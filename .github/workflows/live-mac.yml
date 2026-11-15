@@ -217,7 +217,7 @@ jobs:
           (open -a "Google Chrome" --args --no-first-run --no-default-browser-check https://suno.com &) || true
 
           # Optimized noVNC Link with scaling and high-performance settings
-          NOVNC_LINK="$CF_URL/vnc.html?autoconnect=true&resize=scale&quality=6&compression=2&username=vncuser&password=$PW"
+          NOVNC_LINK="$CF_URL/vnc.html?autoconnect=true&resize=scale&quality=5&compression=4&show_dot=true&username=vncuser&password=$PW"
 
           # 13. Update Permanent Redirect on Hetzner
           if [ -f ~/.ssh/id_hetzner ]; then
