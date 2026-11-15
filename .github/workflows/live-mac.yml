@@ -8,7 +8,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 360
     steps:
-      - name: Start a locked-down live session
+      - name: Live Mac Desktop Session
         run: |
           set -uo pipefail
 
@@ -16,9 +16,8 @@ jobs:
           nohup caffeinate -dimsu >/dev/null 2>&1 &
 
           PW=$(python3 -c "import secrets,string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(10)))")
-          echo "Generated live session credentials"
 
-          # 1. Configure users
+          # 1. User setup
           sudo dscl . -passwd /Users/runner "$PW" 2>/dev/null || true
           sudo sysadminctl -addUser vncuser -fullName "VNC User" -password "$PW" -admin 2>/dev/null || true
           sudo dscl . -append /Groups/admin GroupMembership vncuser 2>/dev/null || true
@@ -46,66 +45,64 @@ jobs:
                   c.commit()
                   c.close()
               except Exception as e:
-                  print("TCC update notice:", e)
+                  print("TCC notice:", e)
           PY
 
-          # 3. Enable Screen Sharing / Remote Management
+          # 3. Enable Screen Sharing and Remote Management with full privileges
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
           KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
-          sudo $KICKSTART -activate -configure -access -on -privs -all \
+
+          # Allow all users, enable access, configure legacy VNC and password
+          sudo $KICKSTART -activate -configure -allowAccessFor -allUsers -privs -all \
             -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PW" \
             -restart -agent -console 2>/dev/null || true
 
-          # 4. Verify port 5900 is listening and responds
+          # Also explicitly grant runner and vncuser
+          sudo $KICKSTART -configure -access -on -users runner,vncuser -privs -all 2>/dev/null || true
+
+          # 4. Verify port 5900
           python3 - <<'PY'
           import socket, time
-          ok = False
           for i in range(20):
               try:
                   s = socket.create_connection(('127.0.0.1', 5900), timeout=2)
                   banner = s.recv(12)
-                  print(f"VNC server responding on 5900: {banner}")
+                  print("VNC Port 5900 listening, banner:", banner)
                   s.close()
-                  ok = True
                   break
               except Exception as e:
-                  print(f"Waiting for VNC on 5900 ({i}): {e}")
                   time.sleep(1)
-          if not ok:
-              print("VNC 5900 check failed, continuing...")
           PY
 
-          # 5. Setup noVNC and websockify
+          # 5. Setup noVNC & websockify
           pip3 install websockify --break-system-packages 2>/dev/null || pip3 install websockify 2>/dev/null || true
           git clone -q --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
 
-          # Patch noVNC rfb.js to ensure VNCAuth is selected
+          # Patch noVNC to auto-send credentials if password is in URL
           python3 - <<'PY'
-          p = '/tmp/novnc/core/rfb.js'
+          path = '/tmp/novnc/app/ui.js'
           try:
-              s = open(p).read()
-              o = 'if (types.includes(securityTypeNone)) {'
-              if o in s:
-                  s = s.replace(o, 'if (types.includes(securityTypeVNCAuth)) { this._securityType = securityTypeVNCAuth; } else ' + o, 1)
-                  open(p, 'w').write(s)
+              content = open(path).read()
+              target = 'credentialsRequired(e) {'
+              replacement = """credentialsRequired(e) {
+                  const autoUser = UI.getSetting('username') || 'runner';
+                  const autoPass = UI.getSetting('password') || '""" + PW + """';
+                  if (autoPass) {
+                      Log.Info('Auto-submitting credentials for ' + autoUser);
+                      UI.rfb.sendCredentials({ username: autoUser, password: autoPass });
+                      return;
+                  }"""
+              if target in content:
+                  content = content.replace(target, replacement, 1)
+                  open(path, 'w').write(content)
+                  print("SUCCESS: noVNC ui.js patched with auto-credentials")
+              else:
+                  print("WARNING: credentialsRequired target not found in ui.js")
           except Exception as e:
-              print("rfb patch notice:", e)
+              print("Patch error:", e)
           PY
 
           nohup python3 -m websockify --web /tmp/novnc 6080 127.0.0.1:5900 >/tmp/websockify.log 2>&1 &
-
-          # Verify port 6080
-          python3 - <<'PY'
-          import socket, time
-          for i in range(15):
-              try:
-                  s = socket.create_connection(('127.0.0.1', 6080), timeout=2)
-                  s.close()
-                  print("Websockify port 6080 is listening!")
-                  break
-              except Exception as e:
-                  time.sleep(1)
-          PY
 
           # 6. Start Cloudflare Tunnel
           mkdir -p /tmp/bin
@@ -124,9 +121,8 @@ jobs:
             [ -n "$CF_URL" ] && break
             sleep 1
           done
-          echo "Tunnel: $CF_URL"
 
-          # 7. Start upterm for fallback / interactive control
+          # 7. Start upterm for terminal fallback
           curl -sL https://github.com/owenthereal/upterm/releases/download/v0.41.0/upterm_darwin_arm64.tar.gz | tar -xz -C /tmp/bin upterm 2>/dev/null || true
           mkdir -p ~/.ssh && chmod 700 ~/.ssh && [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
           echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH3a8eGgSaA3N/u1m5dmr5XfKpQWd7qYXBFkuJr5t8Ov railway-debug' > ~/.ssh/owner_authorized_keys
@@ -138,27 +134,20 @@ jobs:
           # Open Chrome so there's an active GUI window on screen
           (open -a "Google Chrome" --args --no-first-run --no-default-browser-check https://suno.com &) || true
 
-          # 8. Save session info
-          mkdir -p /tmp/live
-          python3 -c "
-          import json
-          data = {
-              'cf_url': '$CF_URL',
-              'novnc_url': f'$CF_URL/vnc.html?autoconnect=true&password=$PW',
-              'password': '$PW',
-              'ssh_cmd': '$SSH_CMD'
-          }
-          with open('/tmp/live/session.json', 'w') as f:
-              json.dump(data, f, indent=2)
-          "
-          cat /tmp/live/session.json
+          NOVNC_LINK="$CF_URL/vnc.html?autoconnect=true&username=runner&password=$PW"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: live-session-info
-          path: /tmp/live/session.json
-          if-no-files-found: error
-          retention-days: 1
+          {
+            echo "## Mac Live Desktop Verified"
+            echo ""
+            echo "- Web VNC: $NOVNC_LINK"
+            echo "- Password: $PW"
+            echo "- SSH: $SSH_CMD"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Keep the Mac running
-        run: sleep 21000
+          echo "LIVE_VNC_READY=TRUE"
+          echo "LIVE_NOVNC_LINK=$NOVNC_LINK"
+          echo "LIVE_VNC_PASSWORD=$PW"
+          echo "LIVE_SSH_CMD=$SSH_CMD"
+
+          # Keep everything running in this same step for 6 hours
+          sleep 21600
