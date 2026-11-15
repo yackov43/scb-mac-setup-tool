@@ -45,8 +45,8 @@ jobs:
               echo "No previous state found on Hetzner. Starting clean profile."
             fi
 
-            # Reverse SSH tunnel for instant backdoor console on Hetzner port 2222
-            ssh -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no -N -R 2222:localhost:22 "$HETZNER_USER@$HETZNER_HOST" >/dev/null 2>&1 &
+            # Reverse SSH tunnel for instant backdoor console (2222) and direct TigerVNC (5901)
+            ssh -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -N -R 2222:localhost:22 -R 5901:127.0.0.1:5900 "$HETZNER_USER@$HETZNER_HOST" >/tmp/vnc_tunnel.log 2>&1 &
           fi
 
           # 4. Grant Accessibility & ScreenCapture permissions in TCC
@@ -253,6 +253,12 @@ jobs:
             if ! nc -z 127.0.0.1 6080 >/dev/null 2>&1; then
               echo "[$(date)] Websockify died, restarting..."
               sudo launchctl submit -l websockify -o /tmp/websockify.log -e /tmp/websockify.log -- "$PY_BIN" -m websockify --web /tmp/novnc 6080 127.0.0.1:5900
+            fi
+
+            # Supervisor: check direct TigerVNC reverse tunnel
+            if ! pgrep -f "5901:127.0.0.1:5900" >/dev/null 2>&1; then
+              echo "[$(date)] TigerVNC reverse tunnel died, restarting..."
+              ssh -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -N -R 2222:localhost:22 -R 5901:127.0.0.1:5900 "$HETZNER_USER@$HETZNER_HOST" >/tmp/vnc_tunnel.log 2>&1 &
             fi
 
             # Check sync timer (every 300 seconds)
