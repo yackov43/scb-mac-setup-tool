@@ -194,27 +194,31 @@ jobs:
 
           # 10. Update Permanent Redirect on Hetzner
           if [ -f ~/.ssh/id_hetzner ]; then
-            ssh -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no "$HETZNER_USER@$HETZNER_HOST" "cat << 'EOF' > /opt/sunocoverbot/app/public/mac.html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset=\"utf-8\">
-  <title>Live Mac VNC</title>
-  <meta http-equiv=\"refresh\" content=\"0; url=$NOVNC_LINK\">
-</head>
-<body style=\"font-family:sans-serif; text-align:center; padding-top:60px; background:#121212; color:#eee;\">
-  <h2>מתחבר ל-Mac בלייב...</h2>
-  <p>אם אינך מועבר אוטומטית תוך 2 שניות, <a href=\"$NOVNC_LINK\" style=\"color:#4fa3d1;\">לחץ כאן למעבר ישיר</a>.</p>
-  <script>window.location.href = \"$NOVNC_LINK\";</script>
-</body>
-</html>
-EOF" 2>/dev/null || true
+            $PY_BIN - <<PY
+          link = '$NOVNC_LINK'
+          html = f"""<!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <title>Live Mac VNC</title>
+            <meta http-equiv="refresh" content="0; url={link}">
+          </head>
+          <body style="font-family:sans-serif; text-align:center; padding-top:60px; background:#121212; color:#eee;">
+            <h2>מתחבר ל-Mac בלייב...</h2>
+            <p>אם אינך מועבר אוטומטית תוך 2 שניות, <a href="{link}" style="color:#4fa3d1;">לחץ כאן למעבר ישיר</a>.</p>
+            <script>window.location.href = "{link}";</script>
+          </body>
+          </html>"""
+          with open('/tmp/mac.html', 'w') as f:
+              f.write(html)
+          PY
+            scp -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no /tmp/mac.html "$HETZNER_USER@$HETZNER_HOST:/opt/sunocoverbot/app/public/mac.html" 2>/dev/null || true
             echo "SUCCESS: Permanent redirect page updated at https://46-225-2-111.sslip.io/mac.html"
           fi
 
           # 11. Start background continuous sync daemon (every 5 minutes)
-          cat << 'SYNC_EOF' > /tmp/bin/sync-daemon.sh
-          #!/bin/bash
+          $PY_BIN - <<PY
+          daemon = '''#!/bin/bash
           while true; do
             sleep 300
             if [ -f ~/.ssh/id_hetzner ]; then
@@ -237,7 +241,10 @@ EOF" 2>/dev/null || true
               ssh -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no "$HETZNER_USER@$HETZNER_HOST" "mv /opt/sunocoverbot/mac-state/mac-state.tar.gz.tmp /opt/sunocoverbot/mac-state/mac-state.tar.gz" 2>/dev/null || true
             fi
           done
-          SYNC_EOF
+          '''
+          with open('/tmp/bin/sync-daemon.sh', 'w') as f:
+              f.write(daemon)
+          PY
           chmod +x /tmp/bin/sync-daemon.sh
           nohup /tmp/bin/sync-daemon.sh > /tmp/sync.log 2>&1 &
 
@@ -269,6 +276,11 @@ EOF" 2>/dev/null || true
       - name: Final Persistent State Sync on Exit
         if: always()
         run: |
+          PY_BIN=$(which python3)
+          if [ -x "/opt/homebrew/bin/python3" ]; then
+            PY_BIN="/opt/homebrew/bin/python3"
+          fi
+
           if [ -f ~/.ssh/id_hetzner ]; then
             echo "Saving final persistent state to Hetzner..."
             sudo tar --exclude="Library/Caches" \
@@ -290,23 +302,26 @@ EOF" 2>/dev/null || true
             echo "Final state saved successfully to Hetzner!"
 
             # Update permanent redirect page to offline status
-            ssh -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no "$HETZNER_USER@$HETZNER_HOST" "cat << 'EOF' > /opt/sunocoverbot/app/public/mac.html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset=\"utf-8\">
-  <title>Live Mac - Stopped</title>
-</head>
-<body style=\"font-family:sans-serif; text-align:center; padding-top:60px; background:#121212; color:#eee;\">
-  <h2>ה-Mac אינו פעיל כרגע</h2>
-  <p>סשן ה-Mac נסגר (או שהסתיימו 6 שעות). כל ההגדרות, התוספים והקבצים שלך נשמרו בהצלחה!</p>
-  <p style=\"margin-top:30px;\">
-    <a href=\"https://github.com/yackov43/scb-mac-setup-tool/actions/workflows/live-mac.yml\" target=\"_blank\" style=\"background:#007acc; color:#fff; padding:12px 24px; text-decoration:none; border-radius:6px; font-weight:bold;\">
-      לחץ כאן כדי להפעיל את ה-Mac מחדש (Run workflow)
-    </a>
-  </p>
-  <p style=\"margin-top:20px; font-size:14px; color:#aaa;\">מיד עם ההפעלה מחדש, הקישור הזה יחזור לפעול אוטומטית עם כל מה שהשארת.</p>
-</body>
-</html>
-EOF" 2>/dev/null || true
+            $PY_BIN - <<PY
+          html = """<!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <title>Live Mac - Stopped</title>
+          </head>
+          <body style="font-family:sans-serif; text-align:center; padding-top:60px; background:#121212; color:#eee;">
+            <h2>ה-Mac אינו פעיל כרגע</h2>
+            <p>סשן ה-Mac נסגר (או שהסתיימו 6 שעות). כל ההגדרות, התוספים והקבצים שלך נשמרו בהצלחה!</p>
+            <p style="margin-top:30px;">
+              <a href="https://github.com/yackov43/scb-mac-setup-tool/actions/workflows/live-mac.yml" target="_blank" style="background:#007acc; color:#fff; padding:12px 24px; text-decoration:none; border-radius:6px; font-weight:bold;">
+                לחץ כאן כדי להפעיל את ה-Mac מחדש (Run workflow)
+              </a>
+            </p>
+            <p style="margin-top:20px; font-size:14px; color:#aaa;">מיד עם ההפעלה מחדש, הקישור הזה יחזור לפעול אוטומטית עם כל מה שהשארת.</p>
+          </body>
+          </html>"""
+          with open('/tmp/mac_stopped.html', 'w') as f:
+              f.write(html)
+          PY
+            scp -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no /tmp/mac_stopped.html "$HETZNER_USER@$HETZNER_HOST:/opt/sunocoverbot/app/public/mac.html" 2>/dev/null || true
           fi
