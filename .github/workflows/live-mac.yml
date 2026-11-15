@@ -8,7 +8,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 360
     steps:
-      - name: Live Mac Desktop Session
+      - name: Start Live Services
         run: |
           set -uo pipefail
 
@@ -17,10 +17,11 @@ jobs:
 
           PW=$(python3 -c "import secrets,string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(10)))")
 
-          # 1. User setup
+          # 1. User configuration
           sudo dscl . -passwd /Users/runner "$PW" 2>/dev/null || true
           sudo sysadminctl -addUser vncuser -fullName "VNC User" -password "$PW" -admin 2>/dev/null || true
           sudo dscl . -append /Groups/admin GroupMembership vncuser 2>/dev/null || true
+          sudo dscl . -passwd /Users/vncuser "$PW" 2>/dev/null || true
 
           # 2. Grant Accessibility & ScreenCapture permissions in TCC
           sudo python3 - <<'PY' || true
@@ -102,9 +103,10 @@ jobs:
               print("Patch error:", e)
           PY
 
-          nohup python3 -m websockify --web /tmp/novnc 6080 127.0.0.1:5900 >/tmp/websockify.log 2>&1 &
+          # Start websockify as a launchd service so it never gets killed between steps
+          sudo launchctl submit -l websockify -o /tmp/websockify.log -e /tmp/websockify.log -- python3 -m websockify --web /tmp/novnc 6080 127.0.0.1:5900
 
-          # 6. Start Cloudflare Tunnel
+          # 6. Start Cloudflare Tunnel as a launchd service
           mkdir -p /tmp/bin
           ARCH=$(uname -m)
           if [ "$ARCH" = "x86_64" ]; then
@@ -113,14 +115,15 @@ jobs:
             curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz | tar -xz -C /tmp/bin
           fi
 
-          nohup /tmp/bin/cloudflared tunnel --url http://127.0.0.1:6080 >/tmp/cf.log 2>&1 &
+          sudo launchctl submit -l cloudflared -o /tmp/cf.log -e /tmp/cf.log -- /tmp/bin/cloudflared tunnel --url http://127.0.0.1:6080
 
           CF_URL=""
-          for i in $(seq 1 40); do
+          for i in $(seq 1 45); do
             CF_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -n1 || true)
             [ -n "$CF_URL" ] && break
             sleep 1
           done
+          echo "Tunnel: $CF_URL"
 
           # 7. Start upterm for terminal fallback
           curl -sL https://github.com/owenthereal/upterm/releases/download/v0.41.0/upterm_darwin_arm64.tar.gz | tar -xz -C /tmp/bin upterm 2>/dev/null || true
@@ -136,18 +139,26 @@ jobs:
 
           NOVNC_LINK="$CF_URL/vnc.html?autoconnect=true&username=runner&password=$PW"
 
-          {
-            echo "## Mac Live Desktop Verified"
-            echo ""
-            echo "- Web VNC: $NOVNC_LINK"
-            echo "- Password: $PW"
-            echo "- SSH: $SSH_CMD"
-          } >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p /tmp/live
+          python3 -c "
+          import json
+          data = {
+              'cf_url': '$CF_URL',
+              'novnc_url': '$NOVNC_LINK',
+              'password': '$PW',
+              'ssh_cmd': '$SSH_CMD'
+          }
+          with open('/tmp/live/session.json', 'w') as f:
+              json.dump(data, f, indent=2)
+          "
+          cat /tmp/live/session.json
 
-          echo "LIVE_VNC_READY=TRUE"
-          echo "LIVE_NOVNC_LINK=$NOVNC_LINK"
-          echo "LIVE_VNC_PASSWORD=$PW"
-          echo "LIVE_SSH_CMD=$SSH_CMD"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: live-session-info
+          path: /tmp/live/session.json
+          if-no-files-found: error
+          retention-days: 1
 
-          # Keep everything running in this same step for 6 hours
-          sleep 21600
+      - name: Keep the Mac alive
+        run: sleep 21600
