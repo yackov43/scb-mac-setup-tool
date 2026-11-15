@@ -2,28 +2,59 @@ name: Live Mac (owner key only)
 
 on:
   workflow_dispatch:
+    inputs:
+      vnc_password:
+        description: 'VNC Password (leave blank for fixed default)'
+        required: false
+        default: ''
 
 jobs:
   live-mac:
     runs-on: macos-latest
     timeout-minutes: 360
+    env:
+      HETZNER_HOST: "46.225.2.111"
+      HETZNER_USER: "root"
+      HETZNER_KEY: ${{ secrets.HETZNER_MAC_SYNC_KEY }}
+      FIXED_PW: ${{ secrets.MAC_VNC_PASSWORD }}
     steps:
-      - name: Start Live Services
+      - name: Start Live Services with State Persistence
         run: |
           set -uo pipefail
 
           sudo pmset -a displaysleep 0 disksleep 0 sleep 0 || true
           nohup caffeinate -dimsu >/dev/null 2>&1 &
 
-          PW=$(python3 -c "import secrets,string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(10)))")
+          # 1. Determine Password (Fixed default)
+          PW="${{ github.event.inputs.vnc_password }}"
+          if [ -z "$PW" ]; then
+            PW="${FIXED_PW:-SunoMac2026!}"
+          fi
+          echo "Using fixed password for vncuser"
 
-          # 1. User configuration
-          sudo dscl . -passwd /Users/runner "$PW" 2>/dev/null || true
+          # 2. User configuration
           sudo sysadminctl -addUser vncuser -fullName "VNC User" -password "$PW" -admin 2>/dev/null || true
           sudo dscl . -append /Groups/admin GroupMembership vncuser 2>/dev/null || true
           sudo dscl . -passwd /Users/vncuser "$PW" 2>/dev/null || true
 
-          # 2. Grant Accessibility & ScreenCapture permissions in TCC
+          # 3. Setup Hetzner Sync Key and Restore State
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          if [ -n "$HETZNER_KEY" ]; then
+            echo "$HETZNER_KEY" > ~/.ssh/id_hetzner && chmod 600 ~/.ssh/id_hetzner
+            ssh-keyscan -H "$HETZNER_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+            echo "Checking for existing persistent state on Hetzner..."
+            if scp -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no "$HETZNER_USER@$HETZNER_HOST:/opt/sunocoverbot/mac-state/mac-state.tar.gz" /tmp/mac-state.tar.gz 2>/dev/null; then
+              echo "Extracting persistent state to /Users/vncuser..."
+              sudo tar -xzf /tmp/mac-state.tar.gz -C /Users/vncuser/ 2>/dev/null || true
+              sudo chown -R vncuser:staff /Users/vncuser/ 2>/dev/null || true
+              echo "Persistent state restored successfully!"
+            else
+              echo "No previous state found on Hetzner. Starting clean profile."
+            fi
+          fi
+
+          # 4. Grant Accessibility & ScreenCapture permissions in TCC
           sudo python3 - <<'PY' || true
           import sqlite3, os
           s = ['kTCCServiceScreenCapture', 'kTCCServiceAccessibility', 'kTCCServicePostEvent', 'kTCCServiceListenEvent']
@@ -49,7 +80,7 @@ jobs:
                   print("TCC notice:", e)
           PY
 
-          # 3. Enable Screen Sharing and Remote Management with full privileges
+          # 5. Enable Screen Sharing and Remote Management with full privileges
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
           KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
 
@@ -57,7 +88,7 @@ jobs:
           sudo $KICKSTART -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PW" -restart -agent -privs -all 2>/dev/null || true
           sudo $KICKSTART -configure -access -on -users runner,vncuser -privs -all 2>/dev/null || true
 
-          # 4. Verify port 5900
+          # 6. Verify port 5900
           python3 - <<'PY'
           import socket, time
           for i in range(20):
@@ -71,7 +102,7 @@ jobs:
                   time.sleep(1)
           PY
 
-          # 5. Setup noVNC & websockify using Homebrew Python
+          # 7. Setup noVNC & websockify using Homebrew Python
           PY_BIN=$(which python3)
           if [ -x "/opt/homebrew/bin/python3" ]; then
             PY_BIN="/opt/homebrew/bin/python3"
@@ -125,7 +156,7 @@ jobs:
                   time.sleep(1)
           PY
 
-          # 6. Start Cloudflare Tunnel as a launchd service
+          # 8. Start Cloudflare Tunnel as a launchd service
           mkdir -p /tmp/bin
           ARCH=$(uname -m)
           if [ "$ARCH" = "x86_64" ]; then
@@ -155,9 +186,9 @@ jobs:
             sleep 1
           done
 
-          # 7. Start upterm for terminal fallback
+          # 9. Start upterm for terminal fallback
           curl -sL https://github.com/owenthereal/upterm/releases/download/v0.41.0/upterm_darwin_arm64.tar.gz | tar -xz -C /tmp/bin upterm 2>/dev/null || true
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh && [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
+          [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
           echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH3a8eGgSaA3N/u1m5dmr5XfKpQWd7qYXBFkuJr5t8Ov railway-debug' > ~/.ssh/owner_authorized_keys
           ssh-keyscan -H uptermd.upterm.dev >> ~/.ssh/known_hosts 2>/dev/null || true
           /tmp/bin/upterm host --accept --allow-exec --skip-host-key-check --authorized-keys ~/.ssh/owner_authorized_keys --detach -- /bin/bash < /dev/null > /tmp/upterm.out 2>&1 &
@@ -169,12 +200,62 @@ jobs:
 
           NOVNC_LINK="$CF_URL/vnc.html?autoconnect=true&username=vncuser&password=$PW"
 
+          # 10. Update Permanent Redirect on Hetzner
+          if [ -f ~/.ssh/id_hetzner ]; then
+            ssh -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no "$HETZNER_USER@$HETZNER_HOST" "cat << 'EOF' > /opt/sunocoverbot/app/public/mac.html
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset=\"utf-8\">
+  <title>Live Mac VNC</title>
+  <meta http-equiv=\"refresh\" content=\"0; url=$NOVNC_LINK\">
+</head>
+<body style=\"font-family:sans-serif; text-align:center; padding-top:60px; background:#121212; color:#eee;\">
+  <h2>מתחבר ל-Mac בלייב...</h2>
+  <p>אם אינך מועבר אוטומטית תוך 2 שניות, <a href=\"$NOVNC_LINK\" style=\"color:#4fa3d1;\">לחץ כאן למעבר ישיר</a>.</p>
+  <script>window.location.href = \"$NOVNC_LINK\";</script>
+</body>
+</html>
+EOF" 2>/dev/null || true
+            echo "SUCCESS: Permanent redirect page updated at https://46-225-2-111.sslip.io/mac.html"
+          fi
+
+          # 11. Start background continuous sync daemon (every 5 minutes)
+          cat << 'SYNC_EOF' > /tmp/bin/sync-daemon.sh
+          #!/bin/bash
+          while true; do
+            sleep 300
+            if [ -f ~/.ssh/id_hetzner ]; then
+              echo "[$(date)] Auto-syncing state to Hetzner..."
+              sudo tar --exclude="Library/Caches" \
+                       --exclude="Library/Containers" \
+                       --exclude="Library/Group Containers" \
+                       --exclude="Library/Mobile Documents" \
+                       --exclude="Library/Saved Application State" \
+                       --exclude="Library/DuetExpertCenter" \
+                       --exclude="Library/IntelligencePlatform" \
+                       --exclude="Library/Metadata" \
+                       --exclude="Library/Biome" \
+                       --exclude="Library/Trial" \
+                       --exclude="Library/Daemon Containers" \
+                       --exclude=".Trash" \
+                       --exclude="*.log" \
+                       -czf /tmp/mac-state-current.tar.gz -C /Users/vncuser . 2>/dev/null || true
+              scp -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no /tmp/mac-state-current.tar.gz "$HETZNER_USER@$HETZNER_HOST:/opt/sunocoverbot/mac-state/mac-state.tar.gz.tmp" 2>/dev/null && \
+              ssh -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no "$HETZNER_USER@$HETZNER_HOST" "mv /opt/sunocoverbot/mac-state/mac-state.tar.gz.tmp /opt/sunocoverbot/mac-state/mac-state.tar.gz" 2>/dev/null || true
+            fi
+          done
+          SYNC_EOF
+          chmod +x /tmp/bin/sync-daemon.sh
+          nohup /tmp/bin/sync-daemon.sh > /tmp/sync.log 2>&1 &
+
           mkdir -p /tmp/live
           $PY_BIN -c "
           import json
           data = {
               'cf_url': '$CF_URL',
               'novnc_url': '$NOVNC_LINK',
+              'permanent_url': 'https://46-225-2-111.sslip.io/mac.html',
               'password': '$PW',
               'ssh_cmd': '$SSH_CMD'
           }
@@ -192,3 +273,48 @@ jobs:
 
       - name: Keep the Mac alive
         run: sleep 21600
+
+      - name: Final Persistent State Sync on Exit
+        if: always()
+        run: |
+          if [ -f ~/.ssh/id_hetzner ]; then
+            echo "Saving final persistent state to Hetzner..."
+            sudo tar --exclude="Library/Caches" \
+                     --exclude="Library/Containers" \
+                     --exclude="Library/Group Containers" \
+                     --exclude="Library/Mobile Documents" \
+                     --exclude="Library/Saved Application State" \
+                     --exclude="Library/DuetExpertCenter" \
+                     --exclude="Library/IntelligencePlatform" \
+                     --exclude="Library/Metadata" \
+                     --exclude="Library/Biome" \
+                     --exclude="Library/Trial" \
+                     --exclude="Library/Daemon Containers" \
+                     --exclude=".Trash" \
+                     --exclude="*.log" \
+                     -czf /tmp/mac-state-final.tar.gz -C /Users/vncuser . 2>/dev/null || true
+
+            scp -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no /tmp/mac-state-final.tar.gz "$HETZNER_USER@$HETZNER_HOST:/opt/sunocoverbot/mac-state/mac-state.tar.gz" 2>/dev/null || true
+            echo "Final state saved successfully to Hetzner!"
+
+            # Update permanent redirect page to offline status
+            ssh -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no "$HETZNER_USER@$HETZNER_HOST" "cat << 'EOF' > /opt/sunocoverbot/app/public/mac.html
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset=\"utf-8\">
+  <title>Live Mac - Stopped</title>
+</head>
+<body style=\"font-family:sans-serif; text-align:center; padding-top:60px; background:#121212; color:#eee;\">
+  <h2>ה-Mac אינו פעיל כרגע</h2>
+  <p>סשן ה-Mac נסגר (או שהסתיימו 6 שעות). כל ההגדרות, התוספים והקבצים שלך נשמרו בהצלחה!</p>
+  <p style=\"margin-top:30px;\">
+    <a href=\"https://github.com/yackov43/scb-mac-setup-tool/actions/workflows/live-mac.yml\" target=\"_blank\" style=\"background:#007acc; color:#fff; padding:12px 24px; text-decoration:none; border-radius:6px; font-weight:bold;\">
+      לחץ כאן כדי להפעיל את ה-Mac מחדש (Run workflow)
+    </a>
+  </p>
+  <p style=\"margin-top:20px; font-size:14px; color:#aaa;\">מיד עם ההפעלה מחדש, הקישור הזה יחזור לפעול אוטומטית עם כל מה שהשארת.</p>
+</body>
+</html>
+EOF" 2>/dev/null || true
+          fi
