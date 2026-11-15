@@ -75,19 +75,23 @@ jobs:
                   time.sleep(1)
           PY
 
-          # 5. Setup noVNC & websockify
-          pip3 install websockify --break-system-packages 2>/dev/null || pip3 install websockify 2>/dev/null || true
+          # 5. Setup noVNC & websockify using Homebrew Python
+          PY_BIN=$(which python3)
+          if [ -x "/opt/homebrew/bin/python3" ]; then
+            PY_BIN="/opt/homebrew/bin/python3"
+          fi
+          $PY_BIN -m pip install websockify --break-system-packages 2>/dev/null || $PY_BIN -m pip install websockify 2>/dev/null || true
           git clone -q --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
 
           # Patch noVNC to auto-send credentials if password is in URL
-          python3 - <<'PY'
+          $PY_BIN - <<PY
           path = '/tmp/novnc/app/ui.js'
           try:
               content = open(path).read()
               target = 'credentialsRequired(e) {'
               replacement = """credentialsRequired(e) {
                   const autoUser = UI.getSetting('username') || 'runner';
-                  const autoPass = UI.getSetting('password') || '""" + PW + """';
+                  const autoPass = UI.getSetting('password') || '$PW';
                   if (autoPass) {
                       Log.Info('Auto-submitting credentials for ' + autoUser);
                       UI.rfb.sendCredentials({ username: autoUser, password: autoPass });
@@ -103,8 +107,21 @@ jobs:
               print("Patch error:", e)
           PY
 
-          # Start websockify as a launchd service so it never gets killed between steps
-          sudo launchctl submit -l websockify -o /tmp/websockify.log -e /tmp/websockify.log -- python3 -m websockify --web /tmp/novnc 6080 127.0.0.1:5900
+          # Start websockify as a launchd service with exact Python binary
+          sudo launchctl submit -l websockify -o /tmp/websockify.log -e /tmp/websockify.log -- "$PY_BIN" -m websockify --web /tmp/novnc 6080 127.0.0.1:5900
+
+          # Verify port 6080 is responding
+          $PY_BIN - <<'PY'
+          import socket, time
+          for i in range(20):
+              try:
+                  s = socket.create_connection(('127.0.0.1', 6080), timeout=2)
+                  s.close()
+                  print("Websockify port 6080 is verified and listening!")
+                  break
+              except Exception as e:
+                  time.sleep(1)
+          PY
 
           # 6. Start Cloudflare Tunnel as a launchd service
           mkdir -p /tmp/bin
@@ -125,6 +142,17 @@ jobs:
           done
           echo "Tunnel: $CF_URL"
 
+          # Verify Cloudflare Tunnel returns HTTP 200 on vnc.html
+          for i in $(seq 1 30); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$CF_URL/vnc.html" || true)
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "SUCCESS: Cloudflare Tunnel verified with HTTP 200!"
+              break
+            fi
+            echo "Waiting for tunnel HTTP 200 (current: $HTTP_CODE)..."
+            sleep 1
+          done
+
           # 7. Start upterm for terminal fallback
           curl -sL https://github.com/owenthereal/upterm/releases/download/v0.41.0/upterm_darwin_arm64.tar.gz | tar -xz -C /tmp/bin upterm 2>/dev/null || true
           mkdir -p ~/.ssh && chmod 700 ~/.ssh && [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
@@ -140,7 +168,7 @@ jobs:
           NOVNC_LINK="$CF_URL/vnc.html?autoconnect=true&username=runner&password=$PW"
 
           mkdir -p /tmp/live
-          python3 -c "
+          $PY_BIN -c "
           import json
           data = {
               'cf_url': '$CF_URL',
