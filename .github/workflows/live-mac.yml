@@ -20,9 +20,10 @@ jobs:
           sudo pmset -a displaysleep 0 disksleep 0 sleep 0 || true
           nohup caffeinate -dimsu >/dev/null 2>&1 &
 
-          # 1. Determine Password (Fixed default)
-          PW="${FIXED_PW:-SunoMac2026!}"
-          echo "Using fixed password for vncuser"
+          # 1. Determine Password (Fixed default with clean sanitization)
+          RAW_PW="${FIXED_PW:-SunoMac2026!}"
+          PW=$(printf "%s" "$RAW_PW" | tr -d '\r\n\ufeff')
+          echo "Using sanitized password for vncuser"
 
           # 2. User configuration
           sudo sysadminctl -addUser vncuser -fullName "VNC User" -password "$PW" -admin 2>/dev/null || true
@@ -44,6 +45,9 @@ jobs:
             else
               echo "No previous state found on Hetzner. Starting clean profile."
             fi
+
+            # Reverse SSH tunnel for instant backdoor console on Hetzner port 2222
+            ssh -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no -N -R 2222:localhost:22 "$HETZNER_USER@$HETZNER_HOST" >/dev/null 2>&1 &
           fi
 
           # 4. Grant Accessibility & ScreenCapture permissions in TCC
@@ -72,7 +76,15 @@ jobs:
                   print("TCC notice:", e)
           PY
 
-          # 5. Enable Screen Sharing and Remote Management with full privileges
+          # 5. Speed up macOS UI (disable heavy animations, transparency, blur)
+          defaults write NSGlobalDomain NSWindowResizeTime -float 0.001 2>/dev/null || true
+          defaults write com.apple.universalaccess reduceTransparency -bool true 2>/dev/null || true
+          defaults write com.apple.universalaccess reduceMotion -bool true 2>/dev/null || true
+          defaults write com.apple.dock launchanim -bool false 2>/dev/null || true
+          defaults write com.apple.dock expose-animation-duration -float 0.1 2>/dev/null || true
+          killall Dock 2>/dev/null || true
+
+          # 6. Enable Screen Sharing and Remote Management with full privileges
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
           KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
 
@@ -80,7 +92,7 @@ jobs:
           sudo $KICKSTART -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PW" -restart -agent -privs -all 2>/dev/null || true
           sudo $KICKSTART -configure -access -on -users runner,vncuser -privs -all 2>/dev/null || true
 
-          # 6. Verify port 5900
+          # 7. Verify port 5900
           python3 - <<'PY'
           import socket, time
           for i in range(20):
@@ -94,12 +106,12 @@ jobs:
                   time.sleep(1)
           PY
 
-          # 7. Setup noVNC & websockify using Homebrew Python
+          # 8. Setup noVNC & websockify with NumPy C-acceleration
           PY_BIN=$(which python3)
           if [ -x "/opt/homebrew/bin/python3" ]; then
             PY_BIN="/opt/homebrew/bin/python3"
           fi
-          $PY_BIN -m pip install websockify --break-system-packages 2>/dev/null || $PY_BIN -m pip install websockify 2>/dev/null || true
+          $PY_BIN -m pip install numpy websockify --break-system-packages 2>/dev/null || $PY_BIN -m pip install numpy websockify 2>/dev/null || true
           git clone -q --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
 
           # Patch noVNC to auto-send credentials if password is in URL
@@ -132,7 +144,7 @@ jobs:
               print("Patch error:", e)
           PY
 
-          # Start websockify as a launchd service with exact Python binary
+          # Start websockify as a launchd service
           sudo launchctl submit -l websockify -o /tmp/websockify.log -e /tmp/websockify.log -- "$PY_BIN" -m websockify --web /tmp/novnc 6080 127.0.0.1:5900
 
           # Verify port 6080 is responding
@@ -148,7 +160,7 @@ jobs:
                   time.sleep(1)
           PY
 
-          # 8. Start Cloudflare Tunnel as a launchd service
+          # 9. Start Cloudflare Tunnel as a launchd service
           mkdir -p /tmp/bin
           ARCH=$(uname -m)
           if [ "$ARCH" = "x86_64" ]; then
@@ -178,7 +190,7 @@ jobs:
             sleep 1
           done
 
-          # 9. Start upterm for terminal fallback
+          # 10. Start upterm for terminal fallback
           curl -sL https://github.com/owenthereal/upterm/releases/download/v0.41.0/upterm_darwin_arm64.tar.gz | tar -xz -C /tmp/bin upterm 2>/dev/null || true
           [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
           echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH3a8eGgSaA3N/u1m5dmr5XfKpQWd7qYXBFkuJr5t8Ov railway-debug' > ~/.ssh/owner_authorized_keys
@@ -187,12 +199,28 @@ jobs:
           for i in $(seq 1 30); do grep -q 'uptermd.upterm.dev' /tmp/upterm.out 2>/dev/null && break; sleep 1; done
           SSH_CMD=$(grep -m1 -o 'ssh [A-Za-z0-9]*@uptermd.upterm.dev' /tmp/upterm.out || echo "")
 
-          # Open Chrome so there's an active GUI window on screen
+          # 11. Kill stuck App Store & Pre-install Telegram Desktop via Homebrew
+          sudo killall -9 "App Store" 2>/dev/null || true
+          killall -9 "App Store" 2>/dev/null || true
+          echo "Pre-installing Telegram Desktop..."
+          brew install --cask telegram 2>/dev/null || true
+          if [ -d "/Applications/Telegram.app" ]; then
+            sudo -u vncuser cp -R /Applications/Telegram.app /Users/vncuser/Desktop/ 2>/dev/null || true
+            (sudo -u vncuser open -a "/Applications/Telegram.app" &) 2>/dev/null || true
+          fi
+
+          # 12. Adjust Display Resolution (1920x1080)
+          curl -sL https://github.com/p00ya/displaymode/releases/download/v1.4.0/displaymode -o /tmp/bin/displaymode 2>/dev/null || true
+          chmod +x /tmp/bin/displaymode 2>/dev/null || true
+          /tmp/bin/displaymode t 1920 1080 2>/dev/null || /tmp/bin/displaymode t 1920 1080 @60 2>/dev/null || true
+
+          # Open Chrome as active GUI window
           (open -a "Google Chrome" --args --no-first-run --no-default-browser-check https://suno.com &) || true
 
-          NOVNC_LINK="$CF_URL/vnc.html?autoconnect=true&username=vncuser&password=$PW"
+          # Optimized noVNC Link with scaling and high-performance settings
+          NOVNC_LINK="$CF_URL/vnc.html?autoconnect=true&resize=scale&quality=6&compression=2&username=vncuser&password=$PW"
 
-          # 10. Update Permanent Redirect on Hetzner
+          # 13. Update Permanent Redirect on Hetzner
           if [ -f ~/.ssh/id_hetzner ]; then
             $PY_BIN - <<PY
           link = '$NOVNC_LINK'
@@ -204,7 +232,7 @@ jobs:
             <meta http-equiv="refresh" content="0; url={link}">
           </head>
           <body style="font-family:sans-serif; text-align:center; padding-top:60px; background:#121212; color:#eee;">
-            <h2>מתחבר ל-Mac בלייב...</h2>
+            <h2>מתחבר ל-Mac בלייב (מסך רחב מותאם)...</h2>
             <p>אם אינך מועבר אוטומטית תוך 2 שניות, <a href="{link}" style="color:#4fa3d1;">לחץ כאן למעבר ישיר</a>.</p>
             <script>window.location.href = "{link}";</script>
           </body>
@@ -216,29 +244,42 @@ jobs:
             echo "SUCCESS: Permanent redirect page updated at https://46-225-2-111.sslip.io/mac.html"
           fi
 
-          # 11. Start background continuous sync daemon (every 5 minutes)
+          # 14. Start background supervisor & continuous sync daemon (every 5 minutes)
           $PY_BIN - <<PY
           daemon = '''#!/bin/bash
           while true; do
-            sleep 300
-            if [ -f ~/.ssh/id_hetzner ]; then
-              echo "[$(date)] Auto-syncing state to Hetzner..."
-              sudo tar --exclude="Library/Caches" \
-                       --exclude="Library/Containers" \
-                       --exclude="Library/Group Containers" \
-                       --exclude="Library/Mobile Documents" \
-                       --exclude="Library/Saved Application State" \
-                       --exclude="Library/DuetExpertCenter" \
-                       --exclude="Library/IntelligencePlatform" \
-                       --exclude="Library/Metadata" \
-                       --exclude="Library/Biome" \
-                       --exclude="Library/Trial" \
-                       --exclude="Library/Daemon Containers" \
-                       --exclude=".Trash" \
-                       --exclude="*.log" \
-                       -czf /tmp/mac-state-current.tar.gz -C /Users/vncuser . 2>/dev/null || true
-              scp -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no /tmp/mac-state-current.tar.gz "$HETZNER_USER@$HETZNER_HOST:/opt/sunocoverbot/mac-state/mac-state.tar.gz.tmp" 2>/dev/null && \
-              ssh -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no "$HETZNER_USER@$HETZNER_HOST" "mv /opt/sunocoverbot/mac-state/mac-state.tar.gz.tmp /opt/sunocoverbot/mac-state/mac-state.tar.gz" 2>/dev/null || true
+            sleep 15
+            # Supervisor: check websockify
+            if ! nc -z 127.0.0.1 6080 >/dev/null 2>&1; then
+              echo "[$(date)] Websockify died, restarting..."
+              sudo launchctl submit -l websockify -o /tmp/websockify.log -e /tmp/websockify.log -- "$PY_BIN" -m websockify --web /tmp/novnc 6080 127.0.0.1:5900
+            fi
+
+            # Check sync timer (every 300 seconds)
+            COUNT=\$(cat /tmp/sync_counter.txt 2>/dev/null || echo 0)
+            COUNT=\$((COUNT + 15))
+            echo "\$COUNT" > /tmp/sync_counter.txt
+            if [ "\$COUNT" -ge 300 ]; then
+              echo "0" > /tmp/sync_counter.txt
+              if [ -f ~/.ssh/id_hetzner ]; then
+                echo "[\$(date)] Auto-syncing state to Hetzner..."
+                sudo tar --exclude="Library/Caches" \
+                         --exclude="Library/Containers" \
+                         --exclude="Library/Group Containers" \
+                         --exclude="Library/Mobile Documents" \
+                         --exclude="Library/Saved Application State" \
+                         --exclude="Library/DuetExpertCenter" \
+                         --exclude="Library/IntelligencePlatform" \
+                         --exclude="Library/Metadata" \
+                         --exclude="Library/Biome" \
+                         --exclude="Library/Trial" \
+                         --exclude="Library/Daemon Containers" \
+                         --exclude=".Trash" \
+                         --exclude="*.log" \
+                         -czf /tmp/mac-state-current.tar.gz -C /Users/vncuser . 2>/dev/null || true
+                scp -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no /tmp/mac-state-current.tar.gz "$HETZNER_USER@$HETZNER_HOST:/opt/sunocoverbot/mac-state/mac-state.tar.gz.tmp" 2>/dev/null && \
+                ssh -i ~/.ssh/id_hetzner -o StrictHostKeyChecking=no "$HETZNER_USER@$HETZNER_HOST" "mv /opt/sunocoverbot/mac-state/mac-state.tar.gz.tmp /opt/sunocoverbot/mac-state/mac-state.tar.gz" 2>/dev/null || true
+              fi
             fi
           done
           '''
