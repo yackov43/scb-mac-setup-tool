@@ -6,7 +6,7 @@ permissions:
   contents: read
 jobs:
   live-mac:
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 360
     steps:
       - name: Start a locked-down live session
