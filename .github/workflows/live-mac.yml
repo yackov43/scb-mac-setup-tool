@@ -53,12 +53,8 @@ jobs:
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
           KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
 
-          # Allow all users, enable access, configure legacy VNC and password
-          sudo $KICKSTART -activate -configure -allowAccessFor -allUsers -privs -all \
-            -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PW" \
-            -restart -agent -console 2>/dev/null || true
-
-          # Also explicitly grant runner and vncuser
+          # Activate, configure access, set legacy VNC and password
+          sudo $KICKSTART -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PW" -restart -agent -privs -all 2>/dev/null || true
           sudo $KICKSTART -configure -access -on -users runner,vncuser -privs -all 2>/dev/null || true
 
           # 4. Verify port 5900
@@ -88,21 +84,27 @@ jobs:
           path = '/tmp/novnc/app/ui.js'
           try:
               content = open(path).read()
-              target = 'credentialsRequired(e) {'
-              replacement = """credentialsRequired(e) {
-                  const autoUser = UI.getSetting('username') || 'runner';
+              t1 = 'credentials(e) {'
+              r1 = '''credentials(e) {
+                  const autoUser = UI.getSetting('username') || 'vncuser';
                   const autoPass = UI.getSetting('password') || '$PW';
                   if (autoPass) {
                       Log.Info('Auto-submitting credentials for ' + autoUser);
                       UI.rfb.sendCredentials({ username: autoUser, password: autoPass });
                       return;
-                  }"""
-              if target in content:
-                  content = content.replace(target, replacement, 1)
-                  open(path, 'w').write(content)
+                  }'''
+              if t1 in content:
+                  content = content.replace(t1, r1, 1)
                   print("SUCCESS: noVNC ui.js patched with auto-credentials")
               else:
-                  print("WARNING: credentialsRequired target not found in ui.js")
+                  print("WARNING: credentials target not found in ui.js")
+
+              t2 = 'credentials: { password: password } }'
+              r2 = "credentials: { username: UI.getSetting('username') || 'vncuser', password: password } }"
+              if t2 in content:
+                  content = content.replace(t2, r2, 1)
+
+              open(path, 'w').write(content)
           except Exception as e:
               print("Patch error:", e)
           PY
@@ -165,7 +167,7 @@ jobs:
           # Open Chrome so there's an active GUI window on screen
           (open -a "Google Chrome" --args --no-first-run --no-default-browser-check https://suno.com &) || true
 
-          NOVNC_LINK="$CF_URL/vnc.html?autoconnect=true&username=runner&password=$PW"
+          NOVNC_LINK="$CF_URL/vnc.html?autoconnect=true&username=vncuser&password=$PW"
 
           mkdir -p /tmp/live
           $PY_BIN -c "
