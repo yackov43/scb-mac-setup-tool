@@ -18,6 +18,10 @@ jobs:
           set -uo pipefail
 
           sudo pmset -a displaysleep 0 disksleep 0 sleep 0 || true
+          defaults -currentHost write com.apple.screensaver idleTime 0 2>/dev/null || true
+          defaults write com.apple.screensaver idleTime 0 2>/dev/null || true
+          defaults write com.apple.screensaver askForPassword 0 2>/dev/null || true
+          sudo defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime 0 2>/dev/null || true
           nohup caffeinate -dimsu >/dev/null 2>&1 &
 
           # 1. Determine Password (Fixed default with clean sanitization)
@@ -88,7 +92,7 @@ jobs:
           KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
 
           # Activate, configure access, set legacy VNC and password
-          sudo $KICKSTART -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PW" -restart -agent -privs -all 2>/dev/null || true
+          sudo $KICKSTART -activate -configure -allowAccessFor -allUsers -privs -all -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$PW" -restart -agent 2>/dev/null || true
           sudo $KICKSTART -configure -access -on -users runner,vncuser -privs -all 2>/dev/null || true
 
           # 7. Verify port 5900
@@ -211,7 +215,7 @@ jobs:
           # 12. Adjust Display Resolution (1920x1080)
           curl -sL https://github.com/p00ya/displaymode/releases/download/v1.4.0/displaymode -o /tmp/bin/displaymode 2>/dev/null || true
           chmod +x /tmp/bin/displaymode 2>/dev/null || true
-          /tmp/bin/displaymode t 1920 1080 2>/dev/null || /tmp/bin/displaymode t 1920 1080 @60 2>/dev/null || true
+          /tmp/bin/displaymode t 1280 720 2>/dev/null || /tmp/bin/displaymode t 1280 720 @60 2>/dev/null || true
 
           # Open Chrome as active GUI window
           (open -a "Google Chrome" --args --no-first-run --no-default-browser-check https://suno.com &) || true
